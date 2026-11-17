@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+**/private.key
+*.key
+backend/venv/
+backend/static/audio/
+__pycache__/
+*.py[cod]
+.pytest_cache/
