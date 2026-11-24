@@ -8,10 +8,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.config.settings import settings
+from app.core.config import settings
 from app.database.connection import Base, get_db
 from app.main import app
-from app.middleware import SlidingWindowLimiter
+from app.core.middleware import SlidingWindowLimiter
 from app.models.call_attempt import CallAttempt
 from app.models.campaign import Campaign
 from app.models.campaign_contact import CampaignContact
@@ -20,7 +20,7 @@ from app.models.conversation_message import ConversationMessage
 from app.models.conversation_session import ConversationSession
 from app.models.customer import Customer
 from app.models.user_account import UserAccount
-from app.observability import redact_log_value
+from app.core.observability import redact_log_value
 from app.services.auth_service import hash_password
 from app.services.conversation_maintenance_service import (
     ConversationMaintenanceService,
@@ -185,10 +185,14 @@ class Phase6ApiSecurityTests(unittest.TestCase):
         with (
             patch.object(settings, "APP_ENV", "production"),
             patch.object(settings, "AUTH_JWT_SECRET", SecretStr("short")),
+            patch.object(settings, "RAG_API_URL", ""),
+            patch.object(settings, "RAG_API_KEY", SecretStr("")),
             self.assertRaises(RuntimeError) as raised,
         ):
             validate_production_settings()
         self.assertIn("AUTH_JWT_SECRET", str(raised.exception))
+        self.assertIn("RAG_API_URL", str(raised.exception))
+        self.assertIn("RAG_API_KEY", str(raised.exception))
 
     def test_rate_limiter_rejects_requests_after_configured_window_limit(self):
         limiter = SlidingWindowLimiter(window_seconds=60)

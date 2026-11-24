@@ -1,6 +1,6 @@
 from threading import Lock
 
-from app.config.settings import settings
+from app.core.config import settings
 from app.services.ai_provider import AIProvider
 from app.services.edge_tts_provider import EdgeTTSProvider
 from app.services.groq_provider import GroqAIProvider

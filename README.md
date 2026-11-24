@@ -12,15 +12,16 @@ other local assistant project.
 
 ## IVR setup
 
-IVR menus are managed through the `/api/ivr/menus/` endpoints. Create a menu
-with keypad options that each have a label and an international destination
-phone number. The active menu is returned by `/api/voice/answer`; selected
-options connect the caller to their configured destination.
+Inbound Vonage calls connect to the live WorldoTutors voice agent. Existing
+keypad menus remain available by adding `?mode=dtmf` to the Vonage answer URL.
+Menus are managed through `/api/ivr/menus/`; selected options connect the
+caller to their configured destination.
 
 Set `PUBLIC_BASE_URL` in the backend environment to the public HTTPS base URL
 of the API (for example, the HTTPS URL of your development tunnel). Vonage
-must be able to reach the `/api/voice/ivr/input` webhook. Configure
-`VONAGE_NUMBER` as the authorized Vonage caller ID when transferring calls.
+must be able to reach the `/api/voice/answer`, `/api/voice/events`, and
+`/api/voice/media` endpoints. Configure `VONAGE_NUMBER` as the authorized
+Vonage caller ID for configured keypad-menu transfers.
 
 ## Provider selection
 
@@ -35,12 +36,42 @@ provider configuration UI is not part of this phase. Supported selectors are:
 | Telephony | `TELEPHONY_PROVIDER` | `vonage` |
 
 Groq requires `GROQ_API_KEY`; speech-to-text uses `GROQ_STT_MODEL`. Edge TTS
-uses `EDGE_TTS_VOICE`. `av` decodes the TTS audio in memory and resamples it
-to Vonage's 16-kHz mono PCM format. Vonage voice calls require `VONAGE_API_KEY`,
+uses `EDGE_TTS_VOICE` for English and `EDGE_TTS_HI_VOICE` for Hindi. `av`
+decodes the TTS audio in memory and resamples it to Vonage's 16-kHz mono PCM
+format. Vonage voice calls require `VONAGE_API_KEY`,
 `VONAGE_SIGNATURE_SECRET`, `VONAGE_APPLICATION_ID`,
 `VONAGE_PRIVATE_KEY_PATH`, `VONAGE_NUMBER`, and an HTTPS `PUBLIC_BASE_URL`.
 Enable **Use signed webhooks** in the Vonage Voice application settings and
 set `VONAGE_SIGNATURE_SECRET` to that application's webhook signing secret.
+Configure its inbound answer URL as the public `/api/voice/answer` endpoint.
+
+## Voice-call RAG backend
+
+Live voice calls get answers from the existing WorldoTutors RAG backend; this
+project does not build or store a second knowledge base. In `backend/.env`, set
+the RAG service base URL and its server-side API key:
+
+```dotenv
+RAG_API_URL=http://127.0.0.1:8001
+RAG_API_KEY=replace-with-your-local-secret
+```
+
+The voice agent sends `POST {RAG_API_URL}/api/voice/chat` with the latest
+transcribed question and up to 12 prior user/assistant messages. It sends the
+`X-API-Key` header and expects a JSON `answer` string. The backend must be able
+to reach this URL; when running in a separate container or machine,
+`127.0.0.1` refers to that container or machine, so use a reachable hostname
+instead. Use HTTPS and a deployment secret manager outside local development.
+
+Requests time out after 12 seconds and are not automatically retried. Network,
+timeout, authentication, and invalid-response failures produce a short spoken
+fallback; API keys, response bodies, and caller questions are not logged. The
+RAG service should return concise answers in the caller's language. Speech is
+transcribed through Groq Whisper, and Hindi callers use the configured Hindi
+Edge TTS voice. Callers can say `repeat` to hear the previous answer or `call
+band` to exit. Silence or unrecognized speech gets one reprompt before the call
+ends. Voice conversations do not promise a human transfer; keypad-menu
+destinations remain available only in the configured DTMF IVR mode.
 
 ## Outbound call dispatch
 
@@ -73,27 +104,33 @@ ambiguous provider outcome is marked `dispatch_unknown` and is not
 automatically retried, because Vonage may have accepted the call before the
 connection failed. Reconcile such calls with Vonage before taking action.
 
-## Live outbound conversations (Phase 5)
+## Live phone conversations (Phase 5)
 
-For outbound dispatches, `/api/voice/answer` returns a Vonage `connect` action
-with a `wss://` media endpoint. The media endpoint requires both the signed
-dispatch reference and Vonage's signed WebSocket authorization. It receives
-live 16-kHz L16 audio, segments speech in memory using voice activity and
-silence detection, and connects each utterance to the configured STT, LLM, and
-TTS providers. TTS output is decoded and sent back to Vonage as paced PCM audio.
-After the initial greeting, speech during response generation/playback cancels
-the stale response and sends Vonage's `clear` command. Conversation messages
-are stored separately per call and campaign transcripts are linked to their
-`CallAttempt`.
+For inbound calls, `/api/voice/answer` registers the call and returns a Vonage
+`connect` action with a signed `wss://` media endpoint. Outbound dispatches use
+the same media route with a signed dispatch reference. Both require Vonage's
+signed WebSocket authorization. The route receives live 16-kHz L16 audio,
+segments speech in memory, transcribes with Groq Whisper, sends the latest
+question and bounded per-call history to the existing RAG API, then speaks its
+`answer` using Edge TTS. TTS output is decoded and sent back as paced PCM audio.
+After the greeting, caller speech during playback cancels the stale response
+and sends Vonage's `clear` command. Conversation messages are stored separately
+per call and campaign transcripts are linked to their `CallAttempt`.
+
+The existing keypad IVR can still be selected by configuring the Vonage answer
+URL with `?mode=dtmf`; its configured destinations are not automatically
+offered as a live voice transfer.
 
 The initial greeting is synthesized and sent before the media handler starts
 processing inbound audio, preventing an early audio frame from cancelling the
 greeting task. WebSocket JSON control messages are handled separately from
 binary PCM frames. Audio pipeline logs include greeting completion, generated
 TTS PCM size/duration, transmitted frame counts, received audio frame counts,
-transcription length, and LLM response duration. TTS, LLM, STT, or playback
-timeouts/failures are logged and terminate the call rather than leaving a
-silent session; voice processing stages have a 45-second timeout.
+transcription length, and RAG response duration. A `repeat` request replays the
+last answer without calling the RAG service. A spoken exit request plays a
+goodbye and ends the call. RAG API failures speak a safe fallback; TTS, STT, or
+playback failures are logged and end the call rather than leaving a silent
+session. Voice processing stages have a 45-second timeout.
 
 The configured Groq Whisper adapter transcribes completed utterances through
 its existing request/response transcription API; it does not provide partial
@@ -128,9 +165,9 @@ WebSocket upgrades to WSS and can reach `/api/voice/answer`,
    .\venv\Scripts\python.exe -m app.worker
    ```
 
-4. Submit a call through `POST /api/calls/outbound` or activate a campaign
-   through the existing campaign endpoints. Use a phone number you control and
-   follow applicable consent and calling rules.
+4. Call the Vonage number from a phone you control to test the inbound agent,
+   or submit a call through `POST /api/calls/outbound`/activate a campaign.
+   Follow applicable consent and calling rules.
 5. Confirm the Vonage event webhook reports the final call status and inspect
    `conversation_sessions`, `conversation_messages`, and (for campaign calls)
    `conversation_attempt_links` for the transcript.
@@ -165,9 +202,9 @@ never be exposed publicly.
 
 Production startup also requires the Vonage signature secret (at least 32
 bytes), Vonage application credentials and readable private key, `GROQ_API_KEY`,
-and an HTTPS `PUBLIC_BASE_URL`. Set secrets in an ignored local `.env` file or
-deployment secret manager; do not commit them. The API and worker both validate
-required production settings on startup.
+`RAG_API_URL`, `RAG_API_KEY`, and an HTTPS `PUBLIC_BASE_URL`. Set secrets in an
+ignored local `.env` file or deployment secret manager; do not commit them. The
+API and worker both validate required production settings on startup.
 
 ### Monitoring, rate limits, and retention
 

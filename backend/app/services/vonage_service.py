@@ -5,7 +5,7 @@ from vonage_http_client.errors import HttpRequestError
 from vonage_voice.models.connect_endpoints import PhoneEndpoint
 from vonage_voice.models.ncco import Connect
 
-from app.config.settings import settings
+from app.core.config import settings
 from app.services.provider_errors import (
     ProviderCallRejected,
     ProviderConfigurationError,

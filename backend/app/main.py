@@ -6,24 +6,24 @@ from sqlalchemy import func, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.config.settings import settings
+from app.core.config import settings
 from app.database.connection import get_db
-from app.middleware import RequestContextMiddleware
+from app.core.middleware import RequestContextMiddleware
 from app.models.call import Call
 from app.models.call_attempt import CallAttempt
 from app.models.call_dispatch_job import CallDispatchJob
 from app.models.conversation_session import ConversationSession
 from app.models.user_account import UserAccount
 from app.models.vonage_webhook_event import VonageWebhookEvent
-from app.observability import configure_logging
-from app.routes.auth_routes import router as auth_router
-from app.routes.call_routes import router as call_router
-from app.routes.voice_routes import router as voice_router
-from app.routes.customer_routes import router as customer_router
-from app.routes.campaign_routes import router as campaign_router
-from app.routes.campaign_contact_routes import router as campaign_contact_router
-from app.routes.conversation_routes import router as conversation_router
-from app.routes.ivr_routes import router as ivr_router
+from app.core.observability import configure_logging
+from app.api.routes.auth import router as auth_router
+from app.api.routes.calls import router as call_router
+from app.api.routes.voice import router as voice_router
+from app.api.routes.customers import router as customer_router
+from app.api.routes.campaigns import router as campaign_router
+from app.api.routes.campaign_contacts import router as campaign_contact_router
+from app.api.routes.conversations import router as conversation_router
+from app.api.routes.ivr import router as ivr_router
 from app.services.auth_service import require_roles, validate_production_settings
 
 logger = logging.getLogger(__name__)

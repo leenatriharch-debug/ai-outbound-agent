@@ -13,7 +13,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import InvalidTokenError
 from sqlalchemy.orm import Session
 
-from app.config.settings import settings
+from app.core.config import settings
 from app.database.connection import get_db
 from app.models.user_account import UserAccount
 
@@ -181,6 +181,11 @@ def validate_production_settings():
         missing.append("VONAGE_SIGNATURE_SECRET (at least 32 bytes)")
     if urlparse(settings.PUBLIC_BASE_URL).scheme != "https":
         missing.append("PUBLIC_BASE_URL (HTTPS)")
+    rag_url = urlparse(settings.RAG_API_URL)
+    if rag_url.scheme != "https" or not rag_url.netloc:
+        missing.append("RAG_API_URL (HTTPS)")
+    if not settings.RAG_API_KEY.get_secret_value():
+        missing.append("RAG_API_KEY")
     for name in (
         "VONAGE_API_KEY",
         "VONAGE_APPLICATION_ID",

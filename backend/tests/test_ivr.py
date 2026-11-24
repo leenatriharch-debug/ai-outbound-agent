@@ -8,9 +8,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.config.settings import settings
+from app.core.config import settings
 from app.database.connection import Base, get_db
 from app.main import app
+from app.models.call import Call
 from app.models import IVRMenu, IVRMenuOption
 
 
@@ -114,6 +115,58 @@ class IVRApiTests(unittest.TestCase):
             response.json()[1]["eventUrl"],
             ["https://example.test/api/voice/ivr/input?menu_id=1&attempt=1"]
         )
+
+    def test_inbound_answer_routes_to_signed_voice_agent_websocket(self):
+        self.create_menu()
+
+        response = self.client.get(
+            "/api/voice/answer",
+            params={
+                "uuid": "inbound-call-uuid",
+                "from": "+14155550111",
+            },
+            headers=self.vonage_headers(),
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        action = response.json()[0]
+        self.assertEqual(action["action"], "connect")
+        endpoint = action["endpoint"][0]
+        self.assertEqual(endpoint["type"], "websocket")
+        self.assertEqual(
+            endpoint["content-type"],
+            "audio/l16;rate=16000",
+        )
+        self.assertIn("inbound_sig=", endpoint["uri"])
+        self.assertEqual(
+            action["eventUrl"],
+            ["https://example.test/api/voice/events"],
+        )
+        db = self.session_factory()
+        try:
+            call = db.query(Call).filter_by(
+                call_uuid="inbound-call-uuid"
+            ).one()
+            self.assertEqual(call.phone_number, "+14155550111")
+            self.assertEqual(call.status, "answered")
+        finally:
+            db.close()
+
+    def test_inbound_dtmf_menu_remains_available_when_requested(self):
+        self.create_menu()
+
+        response = self.client.get(
+            "/api/voice/answer",
+            params={
+                "mode": "dtmf",
+                "uuid": "inbound-dtmf-call",
+                "from": "+14155550112",
+            },
+            headers=self.vonage_headers(),
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()[1]["action"], "input")
 
     def test_valid_digit_connects_to_configured_destination(self):
         self.create_menu()

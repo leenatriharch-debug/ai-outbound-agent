@@ -15,7 +15,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.config.settings import settings
+from app.core.config import settings
 from app.database.connection import Base, get_db
 from app.main import app
 from app.models.call import Call
@@ -600,19 +600,19 @@ class OutboundLifecycleTests(unittest.TestCase):
         )
         with (
             patch(
-                "app.routes.voice_routes.LiveCallConversationService",
+                "app.api.routes.voice.LiveCallConversationService",
                 return_value=SimpleNamespace(),
             ),
             patch(
-                "app.routes.voice_routes.VonageMediaStreamHandler",
+                "app.api.routes.voice.VonageMediaStreamHandler",
                 return_value=fake_handler,
             ),
             patch(
-                "app.routes.voice_routes.get_provider_registry",
+                "app.api.routes.voice.get_provider_registry",
                 return_value=registry,
             ),
             patch(
-                "app.routes.voice_routes.SessionLocal",
+                "app.api.routes.voice.SessionLocal",
                 self.session_factory,
             ),
         ):

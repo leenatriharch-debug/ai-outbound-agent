@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
-from app.config.settings import settings
+from app.core.config import settings
 from app.models.call import Call
 from app.models.call_attempt import CallAttempt
 from app.models.call_dispatch_job import CallDispatchJob

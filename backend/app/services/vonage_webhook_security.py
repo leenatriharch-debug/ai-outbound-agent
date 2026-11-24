@@ -7,7 +7,7 @@ import jwt
 from fastapi import Request, WebSocket
 from jwt import InvalidTokenError
 
-from app.config.settings import settings
+from app.core.config import settings
 
 
 class WebhookVerificationError(RuntimeError):
@@ -149,6 +149,46 @@ def build_media_websocket_url(
     return f"wss://{parsed_base_url.netloc}{path}?{query}"
 
 
+def build_inbound_media_websocket_url(
+    base_url: str,
+    call_id: int,
+    call_uuid: str,
+    signature_secret: str,
+) -> str:
+    if call_id < 1 or not call_uuid:
+        raise WebhookVerificationError("Invalid inbound call reference")
+    if len(signature_secret.encode("utf-8")) < 32:
+        raise WebhookVerificationError(
+            "VONAGE_SIGNATURE_SECRET must be at least 32 bytes",
+            status_code=503
+        )
+    parsed_base_url = urlparse(base_url)
+    if (
+        parsed_base_url.scheme != "https"
+        or not parsed_base_url.netloc
+        or parsed_base_url.username
+        or parsed_base_url.password
+    ):
+        raise WebhookVerificationError(
+            "PUBLIC_BASE_URL must be an HTTPS URL",
+            status_code=503
+        )
+
+    message = f"inbound:media:{call_id}:{call_uuid}".encode("utf-8")
+    signature = hmac.new(
+        signature_secret.encode("utf-8"),
+        message,
+        hashlib.sha256,
+    ).hexdigest()
+    query = urlencode({
+        "inbound_call_id": call_id,
+        "inbound_call_uuid": call_uuid,
+        "inbound_sig": signature,
+    })
+    path = f"{parsed_base_url.path.rstrip('/')}/api/voice/media"
+    return f"wss://{parsed_base_url.netloc}{path}?{query}"
+
+
 def verify_dispatch_callback(
     dispatch_job_id: int,
     signature: str,
@@ -162,5 +202,27 @@ def verify_dispatch_callback(
         settings.VONAGE_SIGNATURE_SECRET.encode("utf-8"),
         message,
         hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def verify_inbound_media_callback(
+    call_id: int,
+    call_uuid: str,
+    signature: str,
+) -> bool:
+    if (
+        not settings.VONAGE_SIGNATURE_SECRET
+        or call_id < 1
+        or not call_uuid
+        or not signature
+    ):
+        return False
+
+    message = f"inbound:media:{call_id}:{call_uuid}".encode("utf-8")
+    expected = hmac.new(
+        settings.VONAGE_SIGNATURE_SECRET.encode("utf-8"),
+        message,
+        hashlib.sha256,
     ).hexdigest()
     return hmac.compare_digest(expected, signature)

@@ -8,7 +8,7 @@ from fastapi import HTTPException, UploadFile
 from starlette.datastructures import Headers
 from vonage_voice.models.requests import CreateCallRequest
 
-from app.config.settings import settings
+from app.core.config import settings
 from app.services.ai_conversation_service import AIConversationService
 from app.services.ai_provider import AIResponse
 from app.services.edge_tts_provider import EdgeTTSProvider
@@ -22,7 +22,11 @@ from app.services.stt import GroqSpeechToTextProvider
 from app.services.telephony_provider import CallRequest
 from app.services.vonage_provider import VonageTelephonyProvider
 from app.services.vonage_service import VonageService
-from app.routes.voice_routes import (
+from app.services.vonage_webhook_security import (
+    build_inbound_media_websocket_url,
+    verify_inbound_media_callback,
+)
+from app.api.routes.voice import (
     AIMessage,
     _read_audio_upload,
     ai_chat,
@@ -83,7 +87,7 @@ class ProviderArchitectureTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch.object(settings, "GROQ_API_KEY", "configured-for-test"):
             with patch(
-                "app.routes.voice_routes.get_provider_registry",
+                "app.api.routes.voice.get_provider_registry",
                 return_value=registry
             ):
                 response = asyncio.run(
@@ -112,7 +116,7 @@ class ProviderArchitectureTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch.object(settings, "GROQ_API_KEY", "configured-for-test"):
             with patch(
-                "app.routes.voice_routes.get_provider_registry",
+                "app.api.routes.voice.get_provider_registry",
                 return_value=registry
             ):
                 response = asyncio.run(speech_to_text(upload))
@@ -147,7 +151,10 @@ class ProviderArchitectureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 413)
 
     async def test_groq_stt_adapter_normalizes_text_and_filename(self):
-        create = AsyncMock(return_value="  recognized words  ")
+        create = AsyncMock(return_value=SimpleNamespace(
+            text="  recognized words  ",
+            language="hi",
+        ))
         client = SimpleNamespace(
             audio=SimpleNamespace(
                 transcriptions=SimpleNamespace(create=create)
@@ -164,6 +171,11 @@ class ProviderArchitectureTests(unittest.IsolatedAsyncioTestCase):
             create.await_args.kwargs["model"],
             settings.GROQ_STT_MODEL
         )
+        self.assertEqual(
+            create.await_args.kwargs["response_format"],
+            "verbose_json",
+        )
+        self.assertEqual(result.language, "hi")
 
     async def test_edge_tts_adapter_collects_audio_stream(self):
         class FakeCommunicate:
@@ -186,6 +198,27 @@ class ProviderArchitectureTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(audio, b"mp3bytes")
+
+    async def test_edge_tts_uses_hindi_voice_for_hindi_language(self):
+        voices = []
+
+        class FakeCommunicate:
+            def __init__(self, text, voice, rate, volume):
+                voices.append(voice)
+
+            async def stream(self):
+                yield {"type": "audio", "data": b"audio"}
+
+        with patch(
+            "app.services.edge_tts_provider.edge_tts.Communicate",
+            FakeCommunicate,
+        ):
+            await EdgeTTSProvider().synthesize(
+                "Namaste",
+                language="hi",
+            )
+
+        self.assertEqual(voices, [settings.EDGE_TTS_HI_VOICE])
 
     def test_vonage_adapter_maps_call_and_control_operations(self):
         class FakeVoice:
@@ -230,6 +263,36 @@ class ProviderArchitectureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(voice.transfer[0], "call-123")
         self.assertTrue(hung_up)
         self.assertEqual(voice.hung_up, "call-123")
+
+    def test_inbound_media_url_is_signed_to_call_reference(self):
+        secret = "test-signature-secret-key-32-bytes"
+        with patch.object(settings, "VONAGE_SIGNATURE_SECRET", secret):
+            url = build_inbound_media_websocket_url(
+                "https://voice.example.test/base",
+                42,
+                "inbound-call-uuid",
+                secret,
+            )
+            signature = url.split("inbound_sig=")[1]
+            self.assertTrue(
+                verify_inbound_media_callback(
+                    42,
+                    "inbound-call-uuid",
+                    signature,
+                )
+            )
+            self.assertFalse(
+                verify_inbound_media_callback(
+                    42,
+                    "different-call",
+                    signature,
+                )
+            )
+
+        self.assertIn(
+            "wss://voice.example.test/base/api/voice/media?",
+            url,
+        )
 
 
 if __name__ == "__main__":

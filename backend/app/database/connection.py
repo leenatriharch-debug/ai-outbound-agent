@@ -1,7 +1,7 @@
 from sqlalchemy import URL, create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-from app.config.settings import settings
+from app.core.config import settings
 
 DATABASE_URL = URL.create(
     "mysql+pymysql",

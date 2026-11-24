@@ -1,7 +1,7 @@
 import logging
 import time
 
-from app.config.settings import settings
+from app.core.config import settings
 from app.database.connection import SessionLocal
 from app.services.call_dispatch_service import CallDispatchService
 from app.services.call_event_service import CallEventService
@@ -9,7 +9,7 @@ from app.services.call_orchestrator import CallOrchestrator
 from app.services.conversation_maintenance_service import (
     ConversationMaintenanceService,
 )
-from app.observability import configure_logging
+from app.core.observability import configure_logging
 from app.services.auth_service import validate_production_settings
 
 logger = logging.getLogger(__name__)

@@ -1,5 +1,5 @@
 from groq import AsyncGroq
-from app.config.settings import settings
+from app.core.config import settings
 from app.services.ai_provider import AIProvider, AIMessage, AIResponse
 from app.services.provider_errors import ProviderConfigurationError
 

@@ -1,6 +1,6 @@
 from groq import AsyncGroq
 
-from app.config.settings import settings
+from app.core.config import settings
 from app.services.provider_errors import ProviderConfigurationError
 from app.services.speech_provider import (
     SpeechRecognitionResult,
@@ -25,12 +25,19 @@ class GroqSpeechToTextProvider(SpeechToTextProvider):
         result = await self.client.audio.transcriptions.create(
             file=(filename, audio_data),
             model=settings.GROQ_STT_MODEL,
-            response_format="text"
+            response_format="verbose_json"
         )
 
+        if isinstance(result, dict):
+            text = result.get("text", "")
+            language = result.get("language")
+        else:
+            text = getattr(result, "text", result)
+            language = getattr(result, "language", None)
+
         return SpeechRecognitionResult(
-            text=str(result).strip(),
-            language=None
+            text=str(text).strip(),
+            language=language
         )
 
 

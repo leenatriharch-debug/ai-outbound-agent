@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
-from app.config.settings import settings
+from app.core.config import settings
 from app.models.conversation_attempt_link import ConversationAttemptLink
 from app.models.conversation_message import ConversationMessage
 from app.models.conversation_session import ConversationSession

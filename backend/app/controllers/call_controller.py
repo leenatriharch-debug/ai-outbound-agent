@@ -1,3 +1,4 @@
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.call import Call
@@ -21,3 +22,30 @@ def create_outbound_call(data: CallCreate, db: Session) -> Call:
         raise
 
     return call
+
+
+def get_or_create_inbound_call(
+    call_uuid: str,
+    phone_number: str,
+    db: Session,
+) -> Call:
+    call = db.query(Call).filter(Call.call_uuid == call_uuid).first()
+    if call:
+        return call
+
+    call = Call(
+        call_uuid=call_uuid,
+        phone_number=phone_number,
+        status="answered",
+    )
+    try:
+        db.add(call)
+        db.commit()
+        db.refresh(call)
+        return call
+    except IntegrityError:
+        db.rollback()
+        call = db.query(Call).filter(Call.call_uuid == call_uuid).first()
+        if call:
+            return call
+        raise

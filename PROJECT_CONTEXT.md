@@ -28,12 +28,14 @@ owner's approval.
 
 - Phases 1–4 provide customer/campaign workflows, call lifecycle handling,
   durable call dispatch, retries, and signed/idempotent Vonage webhook handling.
-- Phase 5 adds Vonage WebSocket media calls and the STT → LLM → TTS conversation
-  path. Audio is handled per call; transcripts are stored in the database.
+- Phase 5 adds inbound and outbound Vonage WebSocket conversations. Groq
+  Whisper transcribes caller speech, the configured WorldoTutors RAG API
+  answers questions, and Edge TTS speaks replies in English or Hindi. Audio
+  and transcripts are handled per call.
 - Phase 6 adds account/role checks, request logging and rate limits, readiness
   and metrics endpoints, audio limits, and worker maintenance for stale
   conversations and transcript retention.
-- The latest recorded backend test run passed **49 tests**. These include
+- The latest recorded backend test run passed **73 tests**. These include
   mocked provider tests. They do **not** prove that a real Vonage call or
   production account has been tested.
 - The project is **not yet production-ready**. Consent/opt-out enforcement,
@@ -52,10 +54,11 @@ Do not describe mocked tests as live-provider verification.
    place a call.
 4. Signed provider callbacks are stored as webhook events and processed by the
    call-event/lifecycle services. Event IDs prevent duplicate processing.
-5. For a live Vonage conversation, the answer flow connects the call to the
-   WebSocket media route. Audio is segmented in memory; completed utterances
-   go through STT, LLM, and TTS. TTS audio is converted to Vonage's expected
-   PCM format and sent back to that call.
+5. For an inbound or outbound Vonage conversation, the answer flow connects
+   the call to the signed WebSocket media route. Audio is segmented in memory;
+   completed utterances go through STT, the existing WorldoTutors RAG API, and
+   TTS. TTS audio is converted to Vonage's expected PCM format and sent back to
+   that call.
 6. Conversation history and transcript rows are associated with that call; a
    campaign transcript is linked to its `CallAttempt`.
 7. The worker also runs periodic stale-conversation recovery and transcript
@@ -70,6 +73,7 @@ Useful implementation files:
   `backend/app/services/call_lifecycle_service.py`
 - Background worker: `backend/app/worker.py`
 - Live audio/conversation processing: `backend/app/services/live_call_service.py`
+- Voice-call RAG API client: `backend/app/services/rag_chat_service.py`
 - Voice, WebSocket, and signed webhook routes: `backend/app/routes/voice_routes.py`
 - Webhook signature and callback helpers:
   `backend/app/services/vonage_webhook_security.py`
@@ -84,18 +88,20 @@ logic.
 
 Current registry choices are:
 
-| Capability | Registered choice today |
+| Capability | Current implementation |
 | --- | --- |
 | LLM | `groq` |
+| Live voice-call answers | WorldoTutors RAG API |
 | STT | `groq` |
 | TTS | `edge_tts` |
 | Telephony | `vonage` |
 
-These settings are in `backend/app/config/settings.py`; registration is in
+Provider selectors are in `backend/app/config/settings.py`; registration is in
 `backend/app/services/provider_registry.py`. There is currently only one
-registered implementation for each capability. Changing a setting to an
-unregistered name fails; a setting alone cannot install or implement a new
-provider.
+registered implementation for each provider capability. Live voice answers use
+the separately configured RAG service (`RAG_API_URL` and `RAG_API_KEY`).
+Changing a provider setting to an unregistered name fails; a setting alone
+cannot install or implement a new provider.
 
 To add another provider:
 
@@ -120,6 +126,7 @@ Relevant interfaces and adapters:
 - `backend/app/services/speech_provider.py`
 - `backend/app/services/telephony_provider.py`
 - `backend/app/services/provider_registry.py`
+- `backend/app/services/rag_chat_service.py`
 - `backend/app/services/groq_provider.py`
 - `backend/app/services/stt.py`
 - `backend/app/services/edge_tts_provider.py`
@@ -163,6 +170,7 @@ Important settings include:
 - Vonage: `VONAGE_API_KEY`, `VONAGE_SIGNATURE_SECRET`,
   `VONAGE_APPLICATION_ID`, `VONAGE_PRIVATE_KEY_PATH`, `VONAGE_NUMBER`,
   `PUBLIC_BASE_URL`
+- Voice RAG API: `RAG_API_URL`, `RAG_API_KEY`
 - Groq: `GROQ_API_KEY`, `GROQ_MODEL`, `GROQ_STT_MODEL`
 - Provider selection: `LLM_PROVIDER`, `STT_PROVIDER`, `TTS_PROVIDER`,
   `TELEPHONY_PROVIDER`
@@ -171,9 +179,10 @@ Important settings include:
   `STALE_CONVERSATION_MINUTES`, `MAINTENANCE_INTERVAL_SECONDS`
 
 Production startup requires valid secrets/provider configuration and an HTTPS
-public base URL. Vonage must be able to reach the application's public webhook
-and WebSocket endpoints. A local `localhost` address is not reachable by
-Vonage.
+public base URL. The RAG API must be reachable from the backend; production
+requires an HTTPS `RAG_API_URL` and `RAG_API_KEY`. Vonage must be able to reach
+the application's public webhook and WebSocket endpoints. A local `localhost`
+address is not reachable by Vonage.
 
 Run commands in PowerShell from `backend`:
 
@@ -195,7 +204,10 @@ confirmed.
 - `backend/tests/test_outbound_lifecycle.py`: dispatch, provider callbacks,
   signatures, idempotency, retry behavior, and worker regression cases.
 - `backend/tests/test_live_call_service.py`: audio segmentation, transcription
-  flow, interruptions, silence, and per-call transcript behavior.
+  flow, RAG conversation history, interruptions, silence, and per-call
+  transcript behavior.
+- `backend/tests/test_rag_chat_service.py`: RAG request contract, bounded
+  history, API failures, and retry behavior.
 - `backend/tests/test_provider_architecture.py`: provider interfaces/registry
   and voice/STT adapter behavior.
 - `backend/tests/test_phase6_security.py`: auth/RBAC, rate limits, readiness,

@@ -4,12 +4,15 @@ import unittest
 import wave
 from array import array
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.core.config import settings
 from app.database.connection import Base
+from app.models.call import Call
 from app.models.call_attempt import CallAttempt
 from app.models.call_dispatch_job import CallDispatchJob
 from app.models.campaign import Campaign
@@ -18,8 +21,6 @@ from app.models.conversation_attempt_link import ConversationAttemptLink
 from app.models.conversation_message import ConversationMessage
 from app.models.conversation_session import ConversationSession
 from app.models.customer import Customer
-from app.services.ai_conversation_service import AIConversationService
-from app.services.ai_provider import AIResponse
 from app.services.live_call_service import (
     AudioTranscodeError,
     AudioTranscoder,
@@ -27,6 +28,7 @@ from app.services.live_call_service import (
     PcmTurnSegmenter,
     VonageMediaStreamHandler,
 )
+from app.services.rag_chat_service import RAGAPIError
 
 
 class FakeSpeechService:
@@ -34,13 +36,19 @@ class FakeSpeechService:
         self.transcriptions = iter(transcriptions)
         self.transcription_audio = []
         self.synthesized_text = []
+        self.synthesized_languages = []
+        self.transcription_language = None
 
     async def convert_audio_to_text(self, audio_data, filename):
         self.transcription_audio.append((audio_data, filename))
-        return SimpleNamespace(text=next(self.transcriptions))
+        return SimpleNamespace(
+            text=next(self.transcriptions),
+            language=self.transcription_language,
+        )
 
-    async def convert_text_to_audio(self, text):
+    async def convert_text_to_audio(self, text, language="en"):
         self.synthesized_text.append(text)
+        self.synthesized_languages.append(language)
         return b"mock encoded audio"
 
 
@@ -50,16 +58,16 @@ class FakeAudioTranscoder:
         return b"\xe8\x03" * 320
 
 
-class FakeAIProvider:
+class FakeRAGService:
     def __init__(self):
         self.requests = []
 
-    async def generate_response(self, messages, system_prompt):
-        self.requests.append((list(messages), system_prompt))
-        return AIResponse(
-            content=f"answer {len(self.requests)}",
-            model="mock",
-        )
+    async def get_answer(self, message, history=None):
+        self.requests.append({
+            "message": message,
+            "history": list(history or []),
+        })
+        return f"answer {len(self.requests)}"
 
 
 class FakeWebSocket:
@@ -188,20 +196,22 @@ class LiveCallServiceTests(unittest.IsolatedAsyncioTestCase):
         self.db.commit()
         return attempt, job
 
-    def _conversation(self, job, texts, provider):
+    def _conversation(self, job, texts, rag_service, language=None):
+        speech_service = FakeSpeechService(texts)
+        speech_service.transcription_language = language
         return LiveCallConversationService(
             dispatch_job_id=job.id,
             session_factory=self.session_factory,
-            ai_service=AIConversationService(provider),
-            speech_service=FakeSpeechService(texts),
+            rag_service=rag_service,
+            speech_service=speech_service,
             transcoder=FakeAudioTranscoder,
         )
 
     async def test_transcripts_history_and_attempt_link_are_persisted_per_call(self):
         attempt_one, job_one = self._create_dispatch_job(1)
         attempt_two, job_two = self._create_dispatch_job(2)
-        provider_one = FakeAIProvider()
-        provider_two = FakeAIProvider()
+        provider_one = FakeRAGService()
+        provider_two = FakeRAGService()
         one = self._conversation(job_one, ["first question", "second question"], provider_one)
         two = self._conversation(job_two, ["other customer"], provider_two)
 
@@ -232,32 +242,146 @@ class LiveCallServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [message.message for message in messages_one],
             [
-                "Hello! This is Worldotech's AI assistant. "
-                "How can I help you today?",
+                settings.CALL_GREETING,
                 "first question",
                 "answer 1",
                 "second question",
                 "answer 2",
             ],
         )
-        second_request = provider_one.requests[1][0]
+        second_request = provider_one.requests[1]["history"]
         self.assertEqual(
             [(message.role, message.content) for message in second_request],
             [
-                (
-                    "assistant",
-                    "Hello! This is Worldotech's AI assistant. "
-                    "How can I help you today?",
-                ),
+                ("assistant", settings.CALL_GREETING),
                 ("user", "first question"),
                 ("assistant", "answer 1"),
-                ("user", "second question"),
             ],
         )
+        self.assertEqual(provider_one.requests[1]["message"], "second question")
         self.assertEqual(
-            [(message.role, message.content) for message in provider_two.requests[0][0]],
-            [("user", "other customer")],
+            [
+                (message.role, message.content)
+                for message in provider_two.requests[0]["history"]
+            ],
+            [],
         )
+        self.assertEqual(provider_two.requests[0]["message"], "other customer")
+
+    async def test_hindi_transcription_uses_hindi_rag_reply_voice(self):
+        _, job = self._create_dispatch_job(4)
+        rag_service = FakeRAGService()
+        conversation = self._conversation(
+            job,
+            ["मुझे फीस बताइए"],
+            rag_service,
+            language="hi",
+        )
+
+        await conversation.start()
+        await conversation.process_utterance(bytes(640))
+
+        self.assertEqual(conversation.caller_language, "hi")
+        self.assertEqual(
+            conversation.speech_service.synthesized_text,
+            ["answer 1"],
+        )
+        self.assertEqual(
+            conversation.speech_service.synthesized_languages,
+            ["hi"],
+        )
+
+    async def test_hinglish_transcription_uses_hindi_voice(self):
+        _, job = self._create_dispatch_job(7)
+        conversation = self._conversation(
+            job,
+            ["Fees kitni hai?"],
+            FakeRAGService(),
+            language="en",
+        )
+
+        await conversation.start()
+        await conversation.process_utterance(bytes(640))
+
+        self.assertEqual(conversation.caller_language, "hi")
+        self.assertEqual(
+            conversation.speech_service.synthesized_languages,
+            ["hi"],
+        )
+
+    async def test_inbound_call_has_its_own_persisted_rag_conversation(self):
+        call = Call(
+            call_uuid="incoming-rag-call",
+            phone_number="+14155550177",
+            status="answered",
+        )
+        self.db.add(call)
+        self.db.commit()
+        rag_service = FakeRAGService()
+        conversation = LiveCallConversationService(
+            dispatch_job_id=None,
+            inbound_call_id=call.id,
+            inbound_call_uuid=call.call_uuid,
+            session_factory=self.session_factory,
+            rag_service=rag_service,
+            speech_service=FakeSpeechService(["How do I enroll?"]),
+            transcoder=FakeAudioTranscoder,
+        )
+
+        await conversation.start()
+        await conversation.greet()
+        await conversation.process_utterance(bytes(640))
+        await conversation.close("completed")
+
+        self.db.expire_all()
+        session = self.db.query(ConversationSession).filter_by(
+            call_id=call.id
+        ).one()
+        stored_call = self.db.query(Call).filter_by(id=call.id).one()
+        self.assertEqual(stored_call.status, "completed")
+        self.assertEqual(session.status, "completed")
+        self.assertEqual(rag_service.requests[0]["message"], "How do I enroll?")
+        self.assertEqual(
+            [(item.role, item.content) for item in rag_service.requests[0]["history"]],
+            [("assistant", settings.CALL_GREETING)],
+        )
+
+    async def test_rag_failure_returns_safe_fallback(self):
+        class FailingRAGService:
+            async def get_answer(self, message, history=None):
+                raise RAGAPIError("http_error", status_code=503)
+
+        _, job = self._create_dispatch_job(5)
+        conversation = self._conversation(
+            job,
+            ["What are your fees?"],
+            FailingRAGService(),
+        )
+
+        await conversation.start()
+        reply, _ = await conversation.process_utterance(bytes(640))
+
+        self.assertIn("can't get that answer", reply)
+        self.assertNotIn("503", reply)
+
+    async def test_repeat_and_exit_commands_do_not_go_to_rag(self):
+        _, job = self._create_dispatch_job(6)
+        rag_service = FakeRAGService()
+        conversation = self._conversation(
+            job,
+            ["What are your fees?", "repeat", "call band"],
+            rag_service,
+        )
+
+        await conversation.start()
+        await conversation.process_utterance(bytes(640))
+        repeated, _ = await conversation.process_utterance(bytes(640))
+        farewell, _ = await conversation.process_utterance(bytes(640))
+
+        self.assertEqual(len(rag_service.requests), 1)
+        self.assertEqual(repeated, "answer 1")
+        self.assertIn("ending the call", farewell)
+        self.assertTrue(conversation.should_end_call)
 
     async def test_vad_segments_speech_and_transcoder_outputs_16khz_pcm(self):
         segmenter = PcmTurnSegmenter(
@@ -348,6 +472,54 @@ class LiveCallServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(websocket.sent_audio, [])
 
+    async def test_playback_pacing_accounts_for_websocket_send_time(self):
+        class FakeClock:
+            now = 0.0
+
+            def time(self):
+                return self.now
+
+            async def sleep(self, delay):
+                self.now += delay
+
+        class TimedWebSocket:
+            def __init__(self, clock):
+                self.clock = clock
+                self.sent_at = []
+
+            async def send_bytes(self, data):
+                self.sent_at.append(self.clock.time())
+                self.clock.now += 0.005
+
+        clock = FakeClock()
+        websocket = TimedWebSocket(clock)
+        handler = VonageMediaStreamHandler(
+            conversation=FakeLiveConversation(),
+            telephony_provider=SimpleNamespace(),
+            call_uuid=None,
+        )
+        handler.websocket = websocket
+
+        with (
+            patch(
+                "app.services.live_call_service.asyncio.get_running_loop",
+                return_value=clock,
+            ),
+            patch(
+                "app.services.live_call_service.asyncio.sleep",
+                new=clock.sleep,
+            ),
+        ):
+            await handler._play_audio(b"\xe8\x03" * (320 * 4))
+
+        self.assertEqual(
+            [round(b - a, 3) for a, b in zip(
+                websocket.sent_at,
+                websocket.sent_at[1:],
+            )],
+            [0.02, 0.02, 0.02],
+        )
+
     async def test_media_stream_handles_control_events_and_multiple_turns(self):
         speech = array("h", [1000] * 320).tobytes()
         websocket = FakeWebSocket([
@@ -388,9 +560,9 @@ class LiveCallServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(websocket.sent_audio), 5)
         self.assertEqual(conversation.closed_status, "completed")
 
-    async def test_websocket_runs_stt_llm_tts_for_multiple_turns(self):
+    async def test_websocket_runs_stt_rag_tts_for_multiple_turns(self):
         attempt, job = self._create_dispatch_job(3)
-        provider = FakeAIProvider()
+        provider = FakeRAGService()
         conversation = self._conversation(
             job,
             ["first question", "second question"],
@@ -438,7 +610,10 @@ class LiveCallServiceTests(unittest.IsolatedAsyncioTestCase):
             [message.message for message in messages[1::2]],
             ["first question", "second question"],
         )
-        self.assertEqual(len(provider.requests), 2)
+        self.assertEqual(
+            [request["message"] for request in provider.requests],
+            ["first question", "second question"],
+        )
         self.assertEqual(len(websocket.sent_audio), 3)
         self.assertTrue(all(len(frame) == 640 for frame in websocket.sent_audio))
         self.assertTrue(all(any(frame) for frame in websocket.sent_audio))
@@ -510,6 +685,64 @@ class LiveCallServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telephony.hung_up, ["silent-call"])
         self.assertEqual(websocket.closed[0][0], 1000)
         self.assertEqual(conversation.closed_status, None)
+
+    async def test_unrecognized_speech_prompts_once_then_hangs_up(self):
+        class FakeTelephonyProvider:
+            def __init__(self):
+                self.hung_up = []
+
+            def hangup_call(self, call_uuid):
+                self.hung_up.append(call_uuid)
+                return True
+
+        websocket = FakeWebSocket([])
+        conversation = FakeLiveConversation()
+        telephony = FakeTelephonyProvider()
+        handler = VonageMediaStreamHandler(
+            conversation=conversation,
+            telephony_provider=telephony,
+            call_uuid="unclear-call",
+            max_reprompts=1,
+        )
+        handler.websocket = websocket
+        handler.running = True
+
+        await handler._handle_unrecognized_speech()
+        self.assertEqual(handler.unrecognized_count, 1)
+        self.assertFalse(websocket.closed)
+
+        await handler._handle_unrecognized_speech()
+
+        self.assertEqual(telephony.hung_up, ["unclear-call"])
+        self.assertEqual(websocket.closed[0][0], 1000)
+
+    async def test_caller_exit_speaks_goodbye_and_ends_the_call(self):
+        class ExitConversation(FakeLiveConversation):
+            should_end_call = True
+
+        class FakeTelephonyProvider:
+            def __init__(self):
+                self.hung_up = []
+
+            def hangup_call(self, call_uuid):
+                self.hung_up.append(call_uuid)
+                return True
+
+        websocket = FakeWebSocket([])
+        conversation = ExitConversation()
+        telephony = FakeTelephonyProvider()
+        handler = VonageMediaStreamHandler(
+            conversation=conversation,
+            telephony_provider=telephony,
+            call_uuid="exit-call",
+        )
+        handler.websocket = websocket
+        handler.running = True
+
+        await handler._respond_to_utterance(bytes(640))
+
+        self.assertEqual(telephony.hung_up, ["exit-call"])
+        self.assertEqual(websocket.closed[0][0], 1000)
 
 
 if __name__ == "__main__":

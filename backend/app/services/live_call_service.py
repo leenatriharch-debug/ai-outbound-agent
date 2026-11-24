@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import math
+import re
 import sys
 import time
 import wave
@@ -13,7 +14,7 @@ from datetime import datetime, timezone
 import av
 from sqlalchemy.orm import Session
 
-from app.config.settings import settings
+from app.core.config import settings
 from app.database.connection import SessionLocal
 from app.models.call import Call
 from app.models.call_attempt import CallAttempt
@@ -21,10 +22,10 @@ from app.models.call_dispatch_job import CallDispatchJob
 from app.models.campaign_contact import CampaignContact
 from app.models.conversation_attempt_link import ConversationAttemptLink
 from app.models.conversation_session import ConversationSession
-from app.services.ai_conversation_service import AIConversationService
 from app.services.ai_provider import AIMessage
 from app.services.conversation_manager import ConversationManager
 from app.services.provider_registry import get_provider_registry
+from app.services.rag_chat_service import RAGAPIError, RAGChatService
 from app.services.speech_processing_service import SpeechProcessingService
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,80 @@ VOICE_RESPONSE_TIMEOUT_SECONDS = 45
 
 class AudioTranscodeError(RuntimeError):
     pass
+
+
+def _normalize_command(text: str) -> str:
+    return " ".join(re.sub(r"[^\w\s]", " ", text.lower()).split())
+
+
+def _is_repeat_request(text: str) -> bool:
+    return _normalize_command(text) in {
+        "repeat",
+        "please repeat",
+        "say that again",
+        "repeat that",
+        "dobara",
+        "dobara boliye",
+        "phir se",
+        "phir se boliye",
+    }
+
+
+def _is_exit_request(text: str) -> bool:
+    return _normalize_command(text) in {
+        "bye",
+        "goodbye",
+        "end call",
+        "hang up",
+        "exit",
+        "stop",
+        "alvida",
+        "call band",
+        "call band karo",
+        "call kaat do",
+        "band karo",
+        "mujhe call band karna hai",
+    }
+
+
+_HINDI_LATIN_MARKERS = {
+    "aap",
+    "batao",
+    "chahiye",
+    "hai",
+    "hain",
+    "ka",
+    "kahaan",
+    "kahan",
+    "kaise",
+    "kar",
+    "karna",
+    "ke",
+    "ki",
+    "kitna",
+    "kitni",
+    "ko",
+    "kya",
+    "mein",
+    "mera",
+    "meri",
+    "mujhe",
+    "nahi",
+    "nahin",
+    "se",
+    "yeh",
+}
+
+
+def _voice_language(language: str | None, text: str = "") -> str:
+    if language and language.lower().split("-")[0] in {"hi", "hindi"}:
+        return "hi"
+    if any("\u0900" <= character <= "\u097f" for character in text):
+        return "hi"
+    words = set(_normalize_command(text).split())
+    if len(words & _HINDI_LATIN_MARKERS) >= 2:
+        return "hi"
+    return "en"
 
 
 def pcm16_to_wav(pcm: bytes) -> bytes:
@@ -183,25 +258,36 @@ class PcmTurnSegmenter:
 class LiveCallConversationService:
     def __init__(
         self,
-        dispatch_job_id: int,
+        dispatch_job_id: int | None,
         session_factory=SessionLocal,
-        ai_service: AIConversationService | None = None,
+        rag_service: RAGChatService | None = None,
         speech_service: SpeechProcessingService | None = None,
         transcoder=AudioTranscoder,
+        inbound_call_id: int | None = None,
+        inbound_call_uuid: str | None = None,
     ):
         registry = get_provider_registry()
         self.dispatch_job_id = dispatch_job_id
+        self.inbound_call_id = inbound_call_id
+        self.inbound_call_uuid = inbound_call_uuid
         self.session_factory = session_factory
-        self.ai_service = ai_service or AIConversationService(
-            registry.get_llm_provider()
-        )
+        self.rag_service = rag_service or RAGChatService()
         self.speech_service = speech_service or registry.get_voice_processing_service()
         self.transcoder = transcoder
         self.conversation_id: int | None = None
         self.history: list[AIMessage] = []
+        self.caller_language = "en"
+        self.should_end_call = False
 
     async def start(self):
-        self.conversation_id = await asyncio.to_thread(self._create_session)
+        if self.dispatch_job_id is not None:
+            self.conversation_id = await asyncio.to_thread(self._create_session)
+        elif self.inbound_call_id is not None:
+            self.conversation_id = await asyncio.to_thread(
+                self._create_inbound_session
+            )
+        else:
+            raise ValueError("A call dispatch or inbound call is required")
         messages = await asyncio.to_thread(self._load_history)
         self.history = [
             AIMessage(role=message.role, content=message.message)
@@ -287,6 +373,43 @@ class LiveCallConversationService:
         finally:
             db.close()
 
+    def _create_inbound_session(self) -> int:
+        if not self.inbound_call_uuid:
+            raise ValueError("Inbound call UUID was not provided")
+        db: Session = self.session_factory()
+        try:
+            call = db.query(Call).filter(
+                Call.id == self.inbound_call_id,
+                Call.call_uuid == self.inbound_call_uuid,
+            ).first()
+            if not call:
+                raise ValueError("Inbound call was not found")
+
+            session_key = f"inbound-call-{call.id}"
+            session = db.query(ConversationSession).filter(
+                ConversationSession.session_id == session_key
+            ).first()
+            if session:
+                if session.status != "active":
+                    raise ValueError(
+                        "The inbound call conversation has ended"
+                    )
+                return session.id
+
+            session = ConversationSession(
+                session_id=session_key,
+                call_id=call.id,
+                status="active",
+            )
+            db.add(session)
+            db.commit()
+            return session.id
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
     def _load_history(self):
         if self.conversation_id is None:
             raise RuntimeError("Conversation has not been started")
@@ -328,19 +451,58 @@ class LiveCallConversationService:
         if not user_text:
             return None
 
+        if _is_repeat_request(user_text):
+            assistant_text = next(
+                (
+                    message.content
+                    for message in reversed(prior_history)
+                    if message.role == "assistant"
+                ),
+                "I haven't answered a question yet. Please ask me one.",
+            )
+            return await self.synthesize_assistant(assistant_text)
+
+        if _is_exit_request(user_text):
+            self.should_end_call = True
+            assistant_text = (
+                "Theek hai, call yahin khatam karte hain. Namaste."
+                if self.caller_language == "hi"
+                else "Okay, ending the call now. Goodbye."
+            )
+            return await self.synthesize_assistant(assistant_text)
+
         started = time.perf_counter()
-        reply = await self.ai_service.generate_response(
-            user_text,
-            history=prior_history,
-        )
-        assistant_text = reply.strip()
+        try:
+            assistant_text = await self.rag_service.get_answer(
+                user_text,
+                history=prior_history,
+            )
+        except RAGAPIError as error:
+            logger.warning(
+                "WorldoTutors RAG API request failed",
+                extra={
+                    "event": "voice_rag_failed",
+                    "dispatch_job_id": self.dispatch_job_id,
+                    "inbound_call_id": self.inbound_call_id,
+                    "failure_type": error.reason,
+                    "status_code": error.status_code,
+                },
+            )
+            assistant_text = (
+                "Maaf kijiye, abhi mujhe iska jawab nahi mil raha. "
+                "Aap dobara pooch sakte hain."
+                if self.caller_language == "hi"
+                else "Sorry, I can't get that answer right now. "
+                "Please try asking again later."
+            )
         if not assistant_text:
-            raise RuntimeError("The LLM provider returned an empty response")
+            raise RuntimeError("The RAG API returned an empty response")
         logger.info(
-            "Live call AI response generated",
+            "Live call RAG response generated",
             extra={
-                "event": "voice_llm_response",
+                "event": "voice_rag_response",
                 "dispatch_job_id": self.dispatch_job_id,
+                "inbound_call_id": self.inbound_call_id,
                 "duration_ms": round((time.perf_counter() - started) * 1000, 2),
                 "text_length": len(assistant_text),
             },
@@ -353,6 +515,10 @@ class LiveCallConversationService:
             "live-utterance.wav",
         )
         user_text = transcription.text.strip()
+        self.caller_language = _voice_language(
+            getattr(transcription, "language", None),
+            user_text,
+        )
         logger.info(
             "Live call speech transcription completed",
             extra={
@@ -374,7 +540,10 @@ class LiveCallConversationService:
         await asyncio.to_thread(self._persist_message, "assistant", text)
         self.history.append(AIMessage(role="assistant", content=text))
         started = time.perf_counter()
-        encoded_audio = await self.speech_service.convert_text_to_audio(text)
+        encoded_audio = await self.speech_service.convert_text_to_audio(
+            text,
+            language=self.caller_language,
+        )
         pcm = await asyncio.to_thread(
             self.transcoder.to_pcm16_mono_16k,
             encoded_audio,
@@ -402,13 +571,21 @@ class LiveCallConversationService:
     def _close_session(self, status: str):
         db: Session = self.session_factory()
         try:
+            now = datetime.now(timezone.utc)
             session = db.query(ConversationSession).filter(
                 ConversationSession.id == self.conversation_id
             ).first()
             if session and session.status == "active":
                 session.status = status
-                session.ended_at = datetime.now(timezone.utc)
-                db.commit()
+                session.ended_at = now
+            if self.inbound_call_id is not None:
+                call = db.query(Call).filter(
+                    Call.id == self.inbound_call_id
+                ).first()
+                if call:
+                    call.status = status
+                    call.completed_at = now
+            db.commit()
         except Exception:
             db.rollback()
             raise
@@ -441,6 +618,7 @@ class VonageMediaStreamHandler:
         self.response_error: Exception | None = None
         self.received_audio_frames = 0
         self.received_audio_bytes = 0
+        self.unrecognized_count = 0
 
     async def run(self, websocket):
         self.websocket = websocket
@@ -689,13 +867,42 @@ class VonageMediaStreamHandler:
             self.conversation.process_utterance(utterance),
             timeout=VOICE_RESPONSE_TIMEOUT_SECONDS,
         )
-        if result is not None:
-            _, pcm = result
-            await asyncio.wait_for(
-                self._play_audio(pcm),
-                timeout=VOICE_RESPONSE_TIMEOUT_SECONDS,
-            )
+        if result is None:
+            await self._handle_unrecognized_speech()
+            return
+
+        self.unrecognized_count = 0
+        _, pcm = result
+        await asyncio.wait_for(
+            self._play_audio(pcm),
+            timeout=VOICE_RESPONSE_TIMEOUT_SECONDS,
+        )
         self.last_activity = time.monotonic()
+        if getattr(self.conversation, "should_end_call", False):
+            await self._end_call("caller_requested_exit")
+
+    async def _handle_unrecognized_speech(self):
+        self.unrecognized_count += 1
+        if self.unrecognized_count <= self.max_reprompts:
+            prompt = (
+                "Maaf kijiye, main samajh nahi paayi. Kripya apna sawaal "
+                "dobara kahiye, ya call band karne ke liye 'call band' kahiye."
+                if getattr(self.conversation, "caller_language", "en") == "hi"
+                else "Sorry, I didn't catch that. Please repeat your question, "
+                "or say 'call band' to end the call."
+            )
+            await self._speak(prompt)
+            return
+
+        goodbye = (
+            "Maaf kijiye, main aapki baat samajh nahi paayi. "
+            "Call yahin khatam karte hain. Namaste."
+            if getattr(self.conversation, "caller_language", "en") == "hi"
+            else "Sorry, I still couldn't understand. I'll end the call now. "
+            "Goodbye."
+        )
+        await self._speak(goodbye)
+        await self._end_call("unrecognized_speech")
 
     async def _speak(self, text: str):
         _, pcm = await asyncio.wait_for(
@@ -714,6 +921,8 @@ class VonageMediaStreamHandler:
                 "Voice playback requires non-silent, aligned PCM audio"
             )
 
+        loop = asyncio.get_running_loop()
+        playback_started = loop.time()
         frames_sent = 0
         for offset in range(0, len(pcm), PLAYBACK_FRAME_BYTES):
             frame = pcm[offset:offset + PLAYBACK_FRAME_BYTES]
@@ -725,7 +934,12 @@ class VonageMediaStreamHandler:
                 await self.websocket.send_bytes(frame)
             frames_sent += 1
             if offset + PLAYBACK_FRAME_BYTES < len(pcm):
-                await asyncio.sleep(PLAYBACK_FRAME_SECONDS)
+                next_frame_at = (
+                    playback_started + frames_sent * PLAYBACK_FRAME_SECONDS
+                )
+                delay = next_frame_at - loop.time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
         logger.info(
             "Live call audio transmitted to Vonage",
             extra={
@@ -768,10 +982,13 @@ class VonageMediaStreamHandler:
             if self.reprompt_count < self.max_reprompts:
                 self.reprompt_count += 1
                 self.last_activity = time.monotonic()
+                prompt = (
+                    "Maaf kijiye, kya aap apna sawaal dobara keh sakte hain?"
+                    if getattr(self.conversation, "caller_language", "en") == "hi"
+                    else "Sorry, I didn't hear you. Could you repeat your question?"
+                )
                 self.response_task = self._create_response_task(
-                    self._speak(
-                        "I didn't hear a response. Are you still there?"
-                    ),
+                    self._speak(prompt),
                     stage="silence_reprompt",
                 )
                 continue
@@ -780,10 +997,20 @@ class VonageMediaStreamHandler:
             return
 
     async def _hangup_after_silence(self):
-        await self._hangup_call("silence_timeout")
+        goodbye = (
+            "Aapka jawab nahi mila, isliye call yahin khatam karte hain. Namaste."
+            if getattr(self.conversation, "caller_language", "en") == "hi"
+            else "I didn't hear a response, so I'll end the call now. Goodbye."
+        )
+        await self._speak(goodbye)
+        await self._end_call("silence_timeout")
+
+    async def _end_call(self, reason: str):
+        await self._hangup_call(reason)
         self.running = False
         try:
-            await self.websocket.close(code=1000)
+            if getattr(self.websocket.client_state, "name", "") == "CONNECTED":
+                await self.websocket.close(code=1000)
         except Exception:
             logger.exception("Could not close the silent call WebSocket")
 

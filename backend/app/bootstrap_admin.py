@@ -1,6 +1,6 @@
 from sqlalchemy.exc import IntegrityError
 
-from app.config.settings import settings
+from app.core.config import settings
 from app.database.connection import SessionLocal
 from app.models.user_account import UserAccount
 from app.services.auth_service import hash_password

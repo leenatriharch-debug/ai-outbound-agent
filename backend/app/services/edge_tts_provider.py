@@ -1,6 +1,6 @@
 import edge_tts
 
-from app.config.settings import settings
+from app.core.config import settings
 from app.services.provider_errors import ProviderConfigurationError
 from app.services.speech_provider import TextToSpeechProvider
 
@@ -13,7 +13,12 @@ class EdgeTTSProvider(TextToSpeechProvider):
         language: str,
         voice: str | None = None
     ) -> bytes:
-        selected_voice = voice or settings.EDGE_TTS_VOICE
+        if voice:
+            selected_voice = voice
+        elif language.lower().startswith("hi"):
+            selected_voice = settings.EDGE_TTS_HI_VOICE
+        else:
+            selected_voice = settings.EDGE_TTS_VOICE
         if not selected_voice:
             raise ProviderConfigurationError(
                 "An Edge TTS voice must be configured"
